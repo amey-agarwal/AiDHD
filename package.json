@@ -11,6 +11,8 @@
     "whatsapp:keepalive": "bash scripts/whatsapp-keepalive.sh"
   },
   "dependencies": {
+    "@browserbasehq/sdk": "^2.16.0",
+    "@browserbasehq/stagehand": "^3.7.1",
     "@elevenlabs/client": "^1.16.0",
     "@elevenlabs/react": "^1.11.0",
     "@google/genai": "^2.13.0",

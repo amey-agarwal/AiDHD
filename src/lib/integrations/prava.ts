@@ -2,6 +2,76 @@ import { randomUUID } from "crypto";
 import { hasPrava } from "./config";
 import { logRequest, logResponse, logInfo, redactPaymentResult } from "../checkout/debug-log";
 
+/**
+ * Typed error codes per docs.prava.space/api-reference/errors.md (verified
+ * 2026-08-02 — see docs/lastminute-prava-integration.md §2). `retriable`
+ * marks codes worth a backoff retry (transient/internal); everything else
+ * (auth, validation, not-found, business-state) is retry-proof and should
+ * fail fast.
+ */
+export const PRAVA_ERROR_INFO = {
+  AUTH_1001: { message: "Invalid or missing API key", retriable: false },
+  AUTH_1002: { message: "Missing or invalid Authorization header", retriable: false },
+  AUTH_1003: { message: "Session has expired", retriable: false },
+  AUTH_1004: { message: "Session has been revoked", retriable: false },
+  VAL_2001: { message: "Request failed schema validation", retriable: false },
+  INVALID_REQUEST: { message: "Missing required field", retriable: false },
+  TRIES_EXHAUSTED: { message: "Account's session allowance is depleted", retriable: false },
+  MERCHANT_LOOKUP_ERROR: { message: "Merchant account unresolvable", retriable: true },
+  CONFIG_ERROR: { message: "Merchant account is missing payment configuration", retriable: false },
+  CARD_NOT_FOUND: { message: "Pre-selected card doesn't exist", retriable: false },
+  CARD_INACTIVE: { message: "Pre-selected card is not active", retriable: false },
+  SESSION_CREATE_ERROR: { message: "Internal session creation failure", retriable: true },
+  NOT_FOUND: { message: "Resource not found", retriable: false },
+  INVALID_STATE: { message: "No transaction awaiting a result / invalid state", retriable: false },
+  MANDATE_EXPIRED: { message: "The mandate has expired", retriable: false },
+  PRODUCT_NOT_FOUND: { message: "Product not found by the given ID", retriable: false },
+  VISA_CONFIRMATION_FAILED: { message: "Card-network confirmation failed", retriable: true },
+  REPORT_STATUS_ERROR: { message: "Internal error reporting status", retriable: true },
+  CUSTOMER_NOT_FOUND: { message: "No customer for the given identifier", retriable: false },
+  NETWORK_DELETE_FAILED: { message: "Card-network deletion failed", retriable: true },
+  THRESHOLD_EXCEEDED: { message: "Visa decline — charge exceeded the authorized cap", retriable: false },
+} as const;
+export type PravaErrorCode = keyof typeof PRAVA_ERROR_INFO;
+
+export class PravaApiError extends Error {
+  code: string;
+  retriable: boolean;
+  raw: unknown;
+  constructor(code: string, message: string, raw?: unknown) {
+    super(message);
+    this.name = "PravaApiError";
+    this.code = code;
+    this.retriable = (PRAVA_ERROR_INFO as Record<string, { retriable: boolean }>)[code]?.retriable ?? false;
+    this.raw = raw;
+  }
+}
+
+function pravaErrorFromBody(body: { error?: string; code?: string; message?: string; detail?: string }, httpStatus: number): PravaApiError {
+  const code = body.code || body.error || `HTTP_${httpStatus}`;
+  const known = (PRAVA_ERROR_INFO as Record<string, { message: string }>)[code];
+  const message = body.message || body.detail || known?.message || `Prava request failed (${httpStatus})`;
+  return new PravaApiError(code, message, body);
+}
+
+/** Retries transient failures (network throw, 5xx, or a documented-retriable code) with exponential backoff. Auth/validation/not-found errors fail fast. */
+async function withPravaRetry<T>(fn: () => Promise<T>, opts: { attempts?: number; baseDelayMs?: number } = {}): Promise<T> {
+  const attempts = opts.attempts ?? 3;
+  const baseDelayMs = opts.baseDelayMs ?? 400;
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const retriable = e instanceof PravaApiError ? e.retriable : true; // network throws are retriable
+      if (!retriable || i === attempts - 1) throw e;
+      await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** i));
+    }
+  }
+  throw lastErr;
+}
+
 export interface PravaSessionResult {
   session_id: string;
   session_token: string;
@@ -272,43 +342,47 @@ export async function getPaymentResult(sessionId: string): Promise<PravaPaymentR
   }
   const url = `https://sandbox.api.prava.space/v1/sessions/${encodeURIComponent(sessionId)}/payment-result`;
   try {
-    const secret = process.env.PRAVA_SECRET_KEY || process.env.PRAVA_API_KEY!;
-    logRequest("prava", "GET", url);
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${secret}` } });
-    if (!res.ok) {
-      logResponse("prava", "GET", url, res.status);
-      return { status: "failed", mode: "live" };
-    }
-    const data = (await res.json()) as {
-      status?: string;
-      transactions?: Array<{
+    return await withPravaRetry(async () => {
+      const secret = process.env.PRAVA_SECRET_KEY || process.env.PRAVA_API_KEY!;
+      logRequest("prava", "GET", url);
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${secret}` } });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        logResponse("prava", "GET", url, res.status, body);
+        throw pravaErrorFromBody(body, res.status);
+      }
+      const data = (await res.json()) as {
         status?: string;
-        line_items?: Array<{
-          token?: string | null;
-          dynamic_cvv?: string | null;
-          expiry_month?: string | null;
-          expiry_year?: string | null;
+        transactions?: Array<{
+          status?: string;
+          line_items?: Array<{
+            token?: string | null;
+            dynamic_cvv?: string | null;
+            expiry_month?: string | null;
+            expiry_year?: string | null;
+          }>;
         }>;
-      }>;
-    };
-    // Credentials sit on the first line item of the first transaction per
-    // docs.prava.space's PaymentResult schema — never at the response's top
-    // level, despite that being a natural first guess.
-    const item = data.transactions?.[0]?.line_items?.[0];
-    const result: PravaPaymentResult = {
-      status: data.status || "awaiting_result",
-      token: item?.token || undefined,
-      dynamic_cvv: item?.dynamic_cvv || undefined,
-      expiry_month: item?.expiry_month || undefined,
-      expiry_year: item?.expiry_year || undefined,
-      mode: "live",
-    };
-    // Logged redacted — see debug-log.ts; token/dynamic_cvv never appear here in full.
-    logResponse("prava", "GET", url, res.status, redactPaymentResult(result));
-    return result;
+      };
+      // Credentials sit on the first line item of the first transaction per
+      // docs.prava.space's PaymentResult schema — never at the response's top
+      // level, despite that being a natural first guess.
+      const item = data.transactions?.[0]?.line_items?.[0];
+      const result: PravaPaymentResult = {
+        status: data.status || "awaiting_result",
+        token: item?.token || undefined,
+        dynamic_cvv: item?.dynamic_cvv || undefined,
+        expiry_month: item?.expiry_month || undefined,
+        expiry_year: item?.expiry_year || undefined,
+        mode: "live",
+      };
+      // Logged redacted — see debug-log.ts; token/dynamic_cvv never appear here in full.
+      logResponse("prava", "GET", url, res.status, redactPaymentResult(result));
+      return result;
+    });
   } catch (e) {
-    logInfo("prava", "GET /payment-result threw", {
+    logInfo("prava", "GET /payment-result failed after retries", {
       message: e instanceof Error ? e.message : "unknown",
+      code: e instanceof PravaApiError ? e.code : undefined,
     });
     return { status: "failed", mode: "live" };
   }
@@ -328,19 +402,64 @@ export async function reportPaymentStatus(
   }
   const url = `https://sandbox.api.prava.space/v1/sessions/${encodeURIComponent(sessionId)}/report-status`;
   try {
+    await withPravaRetry(async () => {
+      const secret = process.env.PRAVA_SECRET_KEY || process.env.PRAVA_API_KEY!;
+      logRequest("prava", "POST", url, { status });
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ status }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        logResponse("prava", "POST", url, res.status, body);
+        throw pravaErrorFromBody(body, res.status);
+      }
+      logResponse("prava", "POST", url, res.status);
+    });
+    return { ok: true };
+  } catch (e) {
+    logInfo("prava", "POST /report-status failed after retries", {
+      message: e instanceof Error ? e.message : "unknown",
+      code: e instanceof PravaApiError ? e.code : undefined,
+    });
+    return { ok: false };
+  }
+}
+
+/**
+ * POST /v1/sessions/:id/revoke — invalidates a session that's no longer
+ * needed (e.g. the harness aborted before spending the one-time token
+ * because the checkout total exceeded the authorized cap). Per errors.md,
+ * a session already completed/expired returns INVALID_STATE, which is not
+ * an error worth surfacing to the caller — the goal (session unusable) is
+ * already achieved.
+ */
+export async function revokeSession(sessionId: string): Promise<{ ok: boolean }> {
+  if (!hasPrava() || sessionId.startsWith("sess_mock") || sessionId.startsWith("sess_err")) {
+    return { ok: true };
+  }
+  const url = `https://sandbox.api.prava.space/v1/sessions/${encodeURIComponent(sessionId)}/revoke`;
+  try {
     const secret = process.env.PRAVA_SECRET_KEY || process.env.PRAVA_API_KEY!;
-    logRequest("prava", "POST", url, { status });
+    logRequest("prava", "POST", url);
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${secret}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status }),
+      headers: { Authorization: `Bearer ${secret}` },
     });
-    logResponse("prava", "POST", url, res.status);
-    return { ok: res.ok };
-  } catch {
+    const body = await res.json().catch(() => ({}));
+    logResponse("prava", "POST", url, res.status, body);
+    if (!res.ok) {
+      const err = pravaErrorFromBody(body, res.status);
+      if (err.code === "INVALID_STATE") return { ok: true };
+      return { ok: false };
+    }
+    return { ok: true };
+  } catch (e) {
+    logInfo("prava", "POST /revoke threw", { message: e instanceof Error ? e.message : "unknown" });
     return { ok: false };
   }
 }

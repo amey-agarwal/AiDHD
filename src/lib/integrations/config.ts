@@ -65,6 +65,21 @@ export function hasGoogleMaps() {
   return Boolean(process.env.GOOGLE_MAPS_API);
 }
 
+/** Browserbase — hosts the remote Chromium session the CheckoutHarness drives. */
+export function hasBrowserbase() {
+  return Boolean(process.env.BROWSERBASE_API_KEY && process.env.BROWSERBASE_PROJECT_ID);
+}
+
+/** browser-use Cloud — CDP-mode fallback session host (never its Agent/task-delegation mode for payment fields). */
+export function hasBrowserUse() {
+  return Boolean(process.env.BROWSEREUSE_API_KEY);
+}
+
+/** Yutori Navigator — optional per-step AI helper for nav/cookie-banner/passenger-detail steps only. */
+export function hasYutori() {
+  return Boolean(process.env.YUTORI_API_KEY);
+}
+
 export function integrationStatus() {
   const llm = hasGemini() ? "gemini" : hasOpenAI() ? "openai" : "mock";
   return {
@@ -82,6 +97,10 @@ export function integrationStatus() {
     eleven_agents: hasElevenAgentsOutbound() ? "live" : "standby",
     twilio: hasTwilio() ? "live" : "mock",
     google_maps: hasGoogleMaps() ? "live" : "standby",
+    lastminute: "live", // public MCP server, no API key required
+    browserbase: hasBrowserbase() ? "live" : "standby",
+    browser_use: hasBrowserUse() ? "live" : "standby",
+    yutori: hasYutori() ? "live" : "standby",
     agents: "subnet",
     nanda: "registered",
   } as const;
